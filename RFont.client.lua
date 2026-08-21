@@ -1,4 +1,4 @@
--- RFont v1.0
+-- RFont v1.0.1
 -- High-performance TrueType software rasterizer for Roblox.
 -- No FontFace/TextLabel is used for the large rendered text.
 --
@@ -16,7 +16,7 @@ local W, H = 1024, 420
 local FONT_NAME = nil
 local FONT_SIZE = 84
 local OVERSAMPLE = 3
-local DEFAULT_TEXT = "RFont — TrueType in Luau"
+local DEFAULT_TEXT = "RFont - TrueType in Luau"
 local MAX_COMPOSITE_DEPTH = 12
 
 local TEXT_R, TEXT_G, TEXT_B = 244, 247, 255
@@ -102,11 +102,24 @@ local fontData=EncodingService:DecompressBuffer(cb,Enum.CompressionAlgorithm.Zst
 ----------------------------------------------------------------
 
 local tables={}
+local fontLength=buffer.len(fontData)
 local numTables=U16(fontData,4)
+
+if 12+numTables*16>fontLength then
+	error("RFont: SFNT table directory runs past the end of the font")
+end
 
 for i=0,numTables-1 do
 	local p=12+i*16
-	tables[tag(fontData,p)]={offset=U32(fontData,p+8),length=U32(fontData,p+12)}
+	local name=tag(fontData,p)
+	local offset=U32(fontData,p+8)
+	local length=U32(fontData,p+12)
+
+	if offset>fontLength or length>fontLength-offset then
+		error(("RFont: table %s is out of bounds"):format(name))
+	end
+
+	tables[name]={offset=offset,length=length}
 end
 
 local function need(name)
@@ -126,9 +139,13 @@ local cmap=need("cmap")
 local unitsPerEm=U16(fontData,head.offset+18)
 local locaFormat=I16(fontData,head.offset+50)
 local numGlyphs=U16(fontData,maxp.offset+4)
-local ascent=I16(fontData,hhea.offset+4)
-local descent=I16(fontData,hhea.offset+6)
-local lineGap=I16(fontData,hhea.offset+8)
+
+-- These are useful once multiline/baseline layout is exposed.
+-- RFont v1 only draws against an explicit baseline, so keep them here for later.
+-- local ascent=I16(fontData,hhea.offset+4)
+-- local descent=I16(fontData,hhea.offset+6)
+-- local lineGap=I16(fontData,hhea.offset+8)
+
 local numHMetrics=U16(fontData,hhea.offset+34)
 
 print(("[RFont] %s | units/em=%d | glyphs=%d"):format(folder.Name,unitsPerEm,numGlyphs))
@@ -139,23 +156,28 @@ print(("[RFont] %s | units/em=%d | glyphs=%d"):format(folder.Name,unitsPerEm,num
 
 local advanceCache={}
 local function hmetric(gid)
-	local c=advanceCache[gid]
-	if c then return c[1],c[2] end
+	local cached=advanceCache[gid]
+	if cached then return cached end
 
-	local adv,lsb
+	local adv
 	if gid<numHMetrics then
 		local p=hmtx.offset+gid*4
 		adv=U16(fontData,p)
-		lsb=I16(fontData,p+2)
+
+		-- Left side bearing was used by an earlier layout pass.
+		-- Keep the read documented here in case explicit glyph metrics come back.
+		-- local lsb=I16(fontData,p+2)
 	else
 		local p=hmtx.offset+(numHMetrics-1)*4
 		adv=U16(fontData,p)
-		local extra=gid-numHMetrics
-		lsb=I16(fontData,hmtx.offset+numHMetrics*4+extra*2)
+
+		-- Same thing here. The trailing hmtx entries are LSB-only values.
+		-- local extra=gid-numHMetrics
+		-- local lsb=I16(fontData,hmtx.offset+numHMetrics*4+extra*2)
 	end
 
-	advanceCache[gid]={adv,lsb}
-	return adv,lsb
+	advanceCache[gid]=adv
+	return adv
 end
 
 local function glyphOffset(gid)
@@ -232,22 +254,41 @@ end
 
 local function lookup4(cp)
 	if not cmap4 or cp>65535 then return nil end
-	for i=0,cmap4.count-1 do
-		local ending=U16(fontData,cmap4.ends+i*2)
+
+	-- Find the first segment whose endCode is >= cp.
+	-- The old version just walked every segment, which was fine for small fonts
+	-- but there is no reason not to do the same binary search we use for cmap 12.
+	local lo,hi=0,cmap4.count-1
+	local found=nil
+
+	while lo<=hi do
+		local mid=math.floor((lo+hi)/2)
+		local ending=U16(fontData,cmap4.ends+mid*2)
 		if cp<=ending then
-			local starting=U16(fontData,cmap4.starts+i*2)
-			if cp<starting then return 0 end
-			local delta=I16(fontData,cmap4.deltas+i*2)
-			local rangeAddress=cmap4.ranges+i*2
-			local ro=U16(fontData,rangeAddress)
-			if ro==0 then return (cp+delta)%65536 end
-			local addr=rangeAddress+ro+(cp-starting)*2
-			local gid=U16(fontData,addr)
-			if gid==0 then return 0 end
-			return (gid+delta)%65536
+			found=mid
+			hi=mid-1
+		else
+			lo=mid+1
 		end
 	end
-	return 0
+
+	if found==nil then return 0 end
+
+	local starting=U16(fontData,cmap4.starts+found*2)
+	if cp<starting then return 0 end
+
+	local delta=I16(fontData,cmap4.deltas+found*2)
+	local rangeAddress=cmap4.ranges+found*2
+	local ro=U16(fontData,rangeAddress)
+
+	if ro==0 then
+		return (cp+delta)%65536
+	end
+
+	local addr=rangeAddress+ro+(cp-starting)*2
+	local gid=U16(fontData,addr)
+	if gid==0 then return 0 end
+	return (gid+delta)%65536
 end
 
 local cpCache={}
@@ -402,9 +443,22 @@ end
 
 local decodeOutline
 
+local function pointAt(contours,index)
+	-- Composite point numbers are zero-based across all contour points.
+	local n=0
+	for _,contour in ipairs(contours) do
+		for _,pt in ipairs(contour) do
+			if n==index then return pt end
+			n+=1
+		end
+	end
+	return nil
+end
+
 decodeOutline=function(gid,depth)
 	depth=depth or 0
 	if depth>MAX_COMPOSITE_DEPTH then return {} end
+	if gid<0 or gid>=numGlyphs then return {} end
 	if outlines[gid] then return outlines[gid] end
 
 	local s=glyphOffset(gid)
@@ -429,19 +483,34 @@ decodeOutline=function(gid,depth)
 		local childGid=U16(fontData,p+2)
 		p+=4
 
+		local argsAreXY=bit32.band(flags,ARGS_XY)~=0
 		local arg1,arg2
+
+		-- Point indices are unsigned. XY offsets are signed.
+		-- The first version treated both paths as signed because I was only testing
+		-- fonts that used XY placement.
 		if bit32.band(flags,ARG_WORDS)~=0 then
-			arg1=I16(fontData,p)
-			arg2=I16(fontData,p+2)
+			if argsAreXY then
+				arg1=I16(fontData,p)
+				arg2=I16(fontData,p+2)
+			else
+				arg1=U16(fontData,p)
+				arg2=U16(fontData,p+2)
+			end
 			p+=4
 		else
-			arg1=I8(fontData,p)
-			arg2=I8(fontData,p+1)
+			if argsAreXY then
+				arg1=I8(fontData,p)
+				arg2=I8(fontData,p+1)
+			else
+				arg1=U8(fontData,p)
+				arg2=U8(fontData,p+1)
+			end
 			p+=2
 		end
 
 		local dx,dy=0,0
-		if bit32.band(flags,ARGS_XY)~=0 then
+		if argsAreXY then
 			dx,dy=arg1,arg2
 		end
 
@@ -463,6 +532,7 @@ decodeOutline=function(gid,depth)
 		end
 
 		local child=decodeOutline(childGid,depth+1)
+		local transformedChild={}
 
 		for _,contour in ipairs(child) do
 			local transformed={}
@@ -470,12 +540,33 @@ decodeOutline=function(gid,depth)
 				-- OpenType composite matrix:
 				-- x' = a*x + c*y; y' = b*x + d*y
 				transformed[#transformed+1]={
-					x=a*pt.x+c*pt.y+dx,
-					y=b*pt.x+d*pt.y+dy,
+					x=a*pt.x+c*pt.y,
+					y=b*pt.x+d*pt.y,
 					on=pt.on,
 				}
 			end
-			result[#result+1]=transformed
+			transformedChild[#transformedChild+1]=transformed
+		end
+
+		if not argsAreXY then
+			-- In this mode arg1 is a point in the parent glyph and arg2 is a point
+			-- in the child component. Line the two points up after the component
+			-- transform has been applied.
+			local parentPoint=pointAt(result,arg1)
+			local childPoint=pointAt(transformedChild,arg2)
+
+			if parentPoint and childPoint then
+				dx=parentPoint.x-childPoint.x
+				dy=parentPoint.y-childPoint.y
+			end
+		end
+
+		for _,contour in ipairs(transformedChild) do
+			for _,pt in ipairs(contour) do
+				pt.x+=dx
+				pt.y+=dy
+			end
+			result[#result+1]=contour
 		end
 	until bit32.band(flags,MORE)==0
 
@@ -732,7 +823,10 @@ end
 local function glyphRun(text)
 	local run={}
 	for _,cp in utf8.codes(text) do
-		run[#run+1]={cp=cp,gid=glyphFor(cp)}
+		-- Used to keep cp in the run as well:
+		-- run[#run+1]={cp=cp,gid=glyphFor(cp)}
+		-- Nothing in the current layout pass needs it after cmap lookup.
+		run[#run+1]={gid=glyphFor(cp)}
 	end
 	return run
 end
@@ -818,7 +912,7 @@ input.TextSize=18
 input.Font=Enum.Font.Code
 input.ClearTextOnFocus=false
 input.Text=DEFAULT_TEXT
-input.PlaceholderText="Type here — large text is rendered by RFont"
+input.PlaceholderText="Type here - large text is rendered by RFont"
 input.Parent=gui
 
 local debug=Instance.new("TextLabel")
@@ -834,11 +928,13 @@ debug.TextXAlignment=Enum.TextXAlignment.Left
 debug.TextYAlignment=Enum.TextYAlignment.Top
 debug.Parent=gui
 
-local generation=0
+-- This used to guard an async render path. render() does not yield anymore,
+-- so a second generation cannot begin in the middle of one render.
+-- local generation=0
 
 local function render(text)
-	generation+=1
-	local my=generation
+	-- generation+=1
+	-- local my=generation
 	local start=os.clock()
 
 	clear()
@@ -859,7 +955,9 @@ local function render(text)
 		110,174,255
 	)
 
-	if my~=generation then return end
+	-- Old async cancellation check. Keeping it here in case raster work gets
+	-- chunked across frames again later.
+	-- if my~=generation then return end
 
 	editable:WritePixelsBuffer(Vector2.zero,Vector2.new(W,H),fb)
 
